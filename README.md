@@ -8,9 +8,15 @@ This PyTorch implementation is loosely based on [Edward Hu](https://github.com/e
 
 ----
 
+![Demo](assets/0.gif)
+
+**Try it out!** We provide model checkpoints and a simple web interface for interaction with the world model. See the [Interactive Web Interface](#interactive-web-interface) section for details.
+
+----
+
 ## Architecture
 
-![Dreamer 4 Architecture](assets/0.png)
+![Dreamer 4 Architecture](assets/1.png)
 
 Dreamer 4 consists of a causal tokenizer and an interactive dynamics model, which both use the same block-causal transformer architecture. The tokenizer encodes partially masked image patches and latent tokens, squeezes the latents through a low-dimensional projection with tanh activation, and decodes the patches. It uses causal attention to achieve temporal compression while allowing frames to be decoded one by one. The dynamics model operates on the interleaved sequence of actions, shortcut noise levels and step sizes, and tokenizer representations. It denoises representations via a shortcut forcing objective.
 
@@ -41,7 +47,7 @@ This will install *most* of the required packages, however, this repository is s
 
 ## Training the Tokenizer
 
-![Tokenizer training](assets/1.png)
+![Tokenizer training](assets/2.png)
 
 To train the Dreamer 4 tokenizer, run the following command:
 
@@ -59,7 +65,7 @@ You can expect training to take approximately 24 hours on 8× RTX 3090 GPUs, aft
 
 ## Training the World Model
 
-![Dynamics training](assets/2.png)
+![Dynamics training](assets/3.png)
 
 To train the Dreamer 4 dynamics model with action conditioning, run the following command:
 
@@ -73,9 +79,9 @@ This will start the training process using 8 GPUs. Note that this script assumes
 
 ## Interactive Web Interface
 
-![Web interface](assets/3.gif)
+![Web interface](assets/4.gif)
 
-We provide a simple web interface for interaction with the trained world model. To start the web server, verify that all paths in `interactive.py` point to valid directories and checkpoints, and then run the following command:
+We provide a simple web interface for interaction with the trained world model. The web serve runs locally on your machine and requires a CUDA-enabled GPU with at least 2 GB memory. Before starting the web server, verify that all paths in `interactive.py` point to valid directories and checkpoints. You can download our provided checkpoints from [HuggingFace](https://huggingface.co/nicklashansen/dreamer4/tree/main) or train your own. To start the web server, run the following command:
 
 ```
 python interactive.py
@@ -93,7 +99,12 @@ assuming the web server is running on `remote-machine` and you want to forward i
 
 ## Checkpoints
 
-Pre-trained tokenizer and dynamics model checkpoints will be made available soon.
+Pre-trained tokenizer and dynamics model checkpoints can be downloaded from [HuggingFace](https://huggingface.co/nicklashansen/dreamer4/tree/main). We provide:
+
+| Model  |  Description  | Resolution | Tasks |
+|--------|---------------|------------|-------|
+| [Tokenizer](https://huggingface.co/nicklashansen/dreamer4/resolve/main/tokenizer_ckpt.pt) | Trained for 90k steps | 128×128 | 30 tasks |
+| [Dynamics Model](https://huggingface.co/nicklashansen/dreamer4/resolve/main/dynamics_ckpt.pt) | Trained for 40k steps with actions |  128×128 | 30 tasks |
 
 ----
 
