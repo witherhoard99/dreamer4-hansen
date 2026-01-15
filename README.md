@@ -34,14 +34,14 @@ In the following, we will walk you through training a **single** world model on 
 
 ## Installation
 
-We recommend installing dependencies in a virtual environment. We provide an `environment.yaml` file for easy installation with [Conda](https://docs.conda.io/en/latest/):
+You will need a machine with at least one CUDA-enabled GPU for inference. If you wish to train the tokenizer or dynamics model yourself we recommend using a machine with >256 GB RAM and 8 GPUs (>24 GB of memory each). We recommend installing dependencies in a virtual environment. We provide an `environment.yaml` file for easy installation with [Conda](https://docs.conda.io/en/latest/):
 
 ```
 conda env create -f environment.yaml
 conda activate dreamer4
 ```
 
-This will install *most* of the required packages, however, this repository is still a work in progress and I need to compile a more refined `environment.yaml` file.
+This should install all required packages. Dataset and model checkpoints are (depending on your use case) optional and can downloaded separately.
 
 ----
 
