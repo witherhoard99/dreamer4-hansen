@@ -94,7 +94,7 @@ def add_sinusoidal_positions(tokens_btSd: torch.Tensor) -> torch.Tensor:
     device = tokens_btSd.device
     pos_t = sinusoid_table(T, D, device=device)  # fp32
     pos_s = sinusoid_table(S, D, device=device)  # fp32
-    pos = (pos_t[None, :, None, :] + pos_s[None, None, :, :]) * (1.0 / math.sqrt(D))
+    pos = (pos_t[None, :, None, :] + pos_s[None, None, :, :])
     return tokens_btSd + pos.to(dtype=tokens_btSd.dtype)
 
 

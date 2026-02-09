@@ -277,8 +277,8 @@ def train(args):
                 patches = temporal_patchify(x, args.patch)
 
                 with torch.no_grad():
-                    z, _ = (model.module.encoder if hasattr(model, "module") else model.encoder)(patches)
                     if is_rank0() and step % args.log_every == 0:
+                        z, _ = (model.module.encoder if hasattr(model, "module") else model.encoder)(patches)
                         wandb.log({"debug/z_std": float(z.float().std().item())}, step=step)
 
                 with autocast(device_type="cuda", enabled=use_amp):
