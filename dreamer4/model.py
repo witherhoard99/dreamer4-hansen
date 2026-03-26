@@ -7,6 +7,7 @@ from typing import Optional, Tuple, Dict
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 
 class Modality(IntEnum):
@@ -30,7 +31,7 @@ class TokenLayout:
         return self.n_latents + sum(n for _, n in self.segments)
 
     def modality_ids(self) -> torch.Tensor:
-        parts = []
+        parts =[]
         if self.n_latents > 0:
             parts.append(torch.full((self.n_latents,), int(Modality.LATENT), dtype=torch.int32))
         for m, n in self.segments:
@@ -52,30 +53,24 @@ class TokenLayout:
 
 
 def temporal_patchify(videos_btchw: torch.Tensor, patch: int) -> torch.Tensor:
-    """
-    videos: (B,T,C,H,W) float in [0,1]
-    returns: (B,T,Np,Dp) where Dp = patch*patch*C and Np = (H/patch)*(W/patch)
-    """
-    assert videos_btchw.dim() == 5
     B, T, C, H, W = videos_btchw.shape
-    assert H % patch == 0 and W % patch == 0
-    x = videos_btchw.reshape(B * T, C, H, W)
-    cols = F.unfold(x, kernel_size=patch, stride=patch)          # (BT, C*pp, Np)
-    cols = cols.transpose(1, 2).contiguous()                     # (BT, Np, Dp)
-    Np, Dp = cols.shape[1], cols.shape[2]
-    return cols.reshape(B, T, Np, Dp)
-
+    # View as (B, T, C, GridH, PatchH, GridW, PatchW)
+    x = videos_btchw.view(B, T, C, H // patch, patch, W // patch, patch)
+    # Permute to (B, T, GridH, GridW, C, PatchH, PatchW)
+    x = x.permute(0, 1, 3, 5, 2, 4, 6)
+    # Flatten to (B, T, Np, Dp)
+    x = x.reshape(B, T, -1, C * patch * patch)
+    return x
 
 def temporal_unpatchify(patches_btnd: torch.Tensor, H: int, W: int, C: int, patch: int) -> torch.Tensor:
-    """
-    patches: (B,T,Np,Dp) -> (B,T,C,H,W)
-    """
-    assert patches_btnd.dim() == 4
     B, T, Np, Dp = patches_btnd.shape
-    assert Dp == C * patch * patch
-    x = patches_btnd.reshape(B * T, Np, Dp).transpose(1, 2).contiguous()  # (BT, Dp, Np)
-    out = F.fold(x, output_size=(H, W), kernel_size=patch, stride=patch)  # (BT, C, H, W)
-    return out.reshape(B, T, C, H, W)
+    # View as (B, T, GridH, GridW, C, PatchH, PatchW)
+    x = patches_btnd.view(B, T, H // patch, W // patch, C, patch, patch)
+    # Permute to (B, T, C, GridH, PatchH, GridW, PatchW)
+    x = x.permute(0, 1, 4, 2, 5, 3, 6)
+    # Flatten to (B, T, C, H, W)
+    x = x.reshape(B, T, C, H, W)
+    return x
 
 
 def sinusoid_table(n: int, d: int, base: float = 10000.0, device=None) -> torch.Tensor:
@@ -94,8 +89,58 @@ def add_sinusoidal_positions(tokens_btSd: torch.Tensor) -> torch.Tensor:
     device = tokens_btSd.device
     pos_t = sinusoid_table(T, D, device=device)  # fp32
     pos_s = sinusoid_table(S, D, device=device)  # fp32
-    pos = (pos_t[None, :, None, :] + pos_s[None, None, :, :]) * (1.0 / math.sqrt(D))
+    pos = (pos_t[None, :, None, :] + pos_s[None, None, :, :])
     return tokens_btSd + pos.to(dtype=tokens_btSd.dtype)
+
+
+def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    """Applies RoPE to Q or K tensors. x: (B, L, H, D)"""
+    d = x.shape[-1]
+    # Split features into pairs
+    x1 = x[..., : d // 2]
+    x2 = x[..., d // 2:]
+    rotated = torch.cat([-x2, x1], dim=-1)
+
+    # Broadcast cos and sin to match x's shape if needed
+    cos = cos.unsqueeze(0).unsqueeze(2)  # (1, L, 1, D)
+    sin = sin.unsqueeze(0).unsqueeze(2)  # (1, L, 1, D)
+
+    return x * cos + rotated * sin
+
+
+def get_1d_rope_freqs(seq_len: int, dim: int, device: torch.device, base: float = 10000.0):
+    inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, device=device).float() / dim))
+    t = torch.arange(seq_len, device=device).float()
+    freqs = torch.outer(t, inv_freq)
+    freqs = torch.cat((freqs, freqs), dim=-1)  # (seq_len, dim)
+    return freqs.cos(), freqs.sin()
+
+
+def get_2d_rope_freqs(h: int, w: int, dim: int, device: torch.device, base: float = 10000.0):
+    # We need half the total dimension for the 2D grid
+    half_dim = dim // 2
+
+    # Calculate base frequencies for 1/4th of the dimension
+    quart_dim = half_dim // 2
+    inv_freq = 1.0 / (base ** (torch.arange(0, quart_dim * 2, 2, device=device).float() / half_dim))
+
+    t_y = torch.arange(h, device=device).float()
+    t_x = torch.arange(w, device=device).float()
+
+    freqs_y = torch.outer(t_y, inv_freq)  # (h, quart_dim)
+    freqs_x = torch.outer(t_x, inv_freq)  # (w, quart_dim)
+
+    # Broadcast to grid
+    freqs_y = freqs_y.view(h, 1, -1).expand(h, w, -1)
+    freqs_x = freqs_x.view(1, w, -1).expand(h, w, -1)
+
+    # Concat Y and X frequencies -> (h, w, half_dim)
+    freqs_2d = torch.cat([freqs_y, freqs_x], dim=-1)
+
+    # Duplicate to match apply_rope's [-x2, x1] structure -> (h, w, dim)
+    freqs_2d = torch.cat([freqs_2d, freqs_2d], dim=-1).reshape(h * w, dim)
+
+    return freqs_2d.cos(), freqs_2d.sin()
 
 
 class MAEReplacer(nn.Module):
@@ -162,48 +207,87 @@ class MLP(nn.Module):
 
 
 class MultiheadSelfAttention(nn.Module):
-    def __init__(self, d_model: int, n_heads: int, dropout: float = 0.0):
+    def __init__(self, d_model: int, n_heads: int, dropout: float = 0.0, qk_norm: bool = False, soft_cap: float = 0.0):
         super().__init__()
-        assert d_model % n_heads == 0
+        # assert d_model % n_heads == 0
         self.d_model = d_model
         self.n_heads = n_heads
         self.head_dim = d_model // n_heads
         self.dropout_p = float(dropout)
+        self.qk_norm = qk_norm
+        self.soft_cap = soft_cap
 
         self.qkv = nn.Linear(d_model, 3 * d_model, bias=True)
         self.out = nn.Linear(d_model, d_model, bias=True)
+        
+        if self.qk_norm:
+            self.q_norm = RMSNorm(self.head_dim)
+            self.k_norm = RMSNorm(self.head_dim)
 
-    def forward(self, x_nld: torch.Tensor, *, attn_mask: Optional[torch.Tensor] = None, is_causal: bool = False):
-        """
-        x: (N,L,D)
-        attn_mask: bool, True means "allowed to attend" (for torch SDPA), broadcastable to (N,1,L,L) or (N,H,L,L)
-        """
+    def forward(self, x_nld:
+    torch.Tensor, *, attn_mask: Optional[torch.Tensor] = None, is_causal: bool = False, rope_cos: Optional[torch.Tensor] = None, rope_sin: Optional[torch.Tensor] = None):
         N, L, D = x_nld.shape
         q, k, v = self.qkv(x_nld).chunk(3, dim=-1)
 
-        q = q.view(N, L, self.n_heads, self.head_dim).transpose(1, 2)
-        k = k.view(N, L, self.n_heads, self.head_dim).transpose(1, 2)
-        v = v.view(N, L, self.n_heads, self.head_dim).transpose(1, 2)
+        # Reshape to (Batch, Seq_len, Heads, Head_dim)
+        q = q.view(N, L, self.n_heads, self.head_dim)
+        k = k.view(N, L, self.n_heads, self.head_dim)
+        v = v.view(N, L, self.n_heads, self.head_dim)
+
+        if self.qk_norm:
+            q = self.q_norm(q)
+            k = self.k_norm(k)
+
+        # Apply RoPE if provided
+        if rope_cos is not None and rope_sin is not None:
+            q = apply_rope(q, rope_cos, rope_sin)
+            k = apply_rope(k, rope_cos, rope_sin)
+
+        # Transpose for SDPA: (Batch, Heads, Seq_len, Head_dim)
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
 
         drop = self.dropout_p if self.training else 0.0
+
         y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=drop, is_causal=is_causal)
+            
         y = y.transpose(1, 2).contiguous().view(N, L, D)
         return self.out(y)
 
 
 class SpaceSelfAttentionModality(nn.Module):
-    def __init__(self, d_model: int, n_heads: int, modality_ids: torch.Tensor, n_latents: int, mode: str, dropout: float):
+    def __init__(self, d_model: int, n_heads: int, modality_ids: torch.Tensor, n_latents: int, mode: str, dropout: float, qk_norm: bool = False, soft_cap: float = 0.0):
         super().__init__()
         self.n_latents = int(n_latents)
         self.mode = mode
         self.register_buffer("modality_ids", modality_ids.to(torch.int32), persistent=False)
+        device = modality_ids.device
 
         S = int(self.modality_ids.numel())
-        allow = self._build_allow(S)                               # (S,S) True=allowed
-        attn_mask = allow.unsqueeze(0).unsqueeze(0)                # (1,1,S,S) True=allowed (PyTorch SDPA bool mask)
+        allow = self._build_allow(S)
+        attn_mask = allow.unsqueeze(0).unsqueeze(0)
         self.register_buffer("attn_mask", attn_mask, persistent=False)
 
-        self.attn = MultiheadSelfAttention(d_model, n_heads, dropout=dropout)
+        self.attn = MultiheadSelfAttention(d_model, n_heads, dropout=dropout, qk_norm=qk_norm, soft_cap=soft_cap)
+
+        spatial_mask = (self.modality_ids == int(Modality.IMAGE)) | (self.modality_ids == int(Modality.SPATIAL))
+        num_spatial = spatial_mask.sum().item()
+
+        rope_cos = torch.ones((S, self.attn.head_dim), dtype=torch.float32, device=device)
+        rope_sin = torch.zeros((S, self.attn.head_dim), dtype=torch.float32, device=device)
+
+        if num_spatial > 0:
+            grid_size = int(math.sqrt(num_spatial))
+            assert grid_size * grid_size == num_spatial, "Spatial tokens must form a square grid for 2D RoPE"
+
+            cos_2d, sin_2d = get_2d_rope_freqs(grid_size, grid_size, self.attn.head_dim, device=device)
+
+            rope_cos[spatial_mask] = cos_2d
+            rope_sin[spatial_mask] = sin_2d
+
+        self.register_buffer("rope_cos", rope_cos, persistent=False)
+        self.register_buffer("rope_sin", rope_sin, persistent=False)
 
     def _build_allow(self, S: int) -> torch.Tensor:
         device = self.modality_ids.device
@@ -252,32 +336,47 @@ class SpaceSelfAttentionModality(nn.Module):
     def forward(self, x_btSd: torch.Tensor) -> torch.Tensor:
         B, T, S, D = x_btSd.shape
         x = x_btSd.reshape(B * T, S, D)
+
         mask = self.attn_mask.expand(B * T, 1, S, S)
-        y = self.attn(x, attn_mask=mask, is_causal=False)
+
+        y = self.attn(x, attn_mask=mask, is_causal=False, rope_cos=self.rope_cos, rope_sin=self.rope_sin)
+
         return y.reshape(B, T, S, D)
 
 
 class TimeSelfAttention(nn.Module):
-    def __init__(self, d_model: int, n_heads: int, dropout: float, latents_only: bool, n_latents: int):
+    def __init__(self, d_model: int, n_heads: int, dropout: float, latents_only: bool, n_latents: int, device: torch.device, max_time_steps: int = 4096, qk_norm: bool = False, soft_cap: float = 0.0):
         super().__init__()
         self.latents_only = bool(latents_only)
         self.n_latents = int(n_latents)
-        self.attn = MultiheadSelfAttention(d_model, n_heads, dropout=dropout)
+        self.attn = MultiheadSelfAttention(d_model, n_heads, dropout=dropout, qk_norm=qk_norm, soft_cap=soft_cap)
+
+        cos_1d, sin_1d = get_1d_rope_freqs(max_time_steps, self.attn.head_dim, device=device)
+        self.register_buffer("rope_cos", cos_1d, persistent=False)
+        self.register_buffer("rope_sin", sin_1d, persistent=False)
 
     def forward(self, x_btSd: torch.Tensor) -> torch.Tensor:
         B, T, S, D = x_btSd.shape
+
+        assert T <= self.rope_cos.shape[0], f"Sequence length {T} exceeds cached maximum of {self.rope_cos.shape[0]}"
+
+        rope_cos = self.rope_cos[:T]
+        rope_sin = self.rope_sin[:T]
+
         if self.latents_only:
             L = self.n_latents
-            lat = x_btSd[:, :, :L, :]  # (B,T,L,D)
+            lat = x_btSd[:, :, :L, :]
             lat_nld = lat.permute(0, 2, 1, 3).contiguous().view(B * L, T, D)
-            out = self.attn(lat_nld, is_causal=True)
+
+            out = self.attn(lat_nld, is_causal=True, rope_cos=rope_cos, rope_sin=rope_sin)
+
             out = out.view(B, L, T, D).permute(0, 2, 1, 3).contiguous()
             x = x_btSd.clone()
             x[:, :, :L, :] = out
             return x
         else:
             x_nld = x_btSd.permute(0, 2, 1, 3).contiguous().view(B * S, T, D)
-            out = self.attn(x_nld, is_causal=True)
+            out = self.attn(x_nld, is_causal=True, rope_cos=rope_cos, rope_sin=rope_sin)
             return out.view(B, S, T, D).permute(0, 2, 1, 3).contiguous()
 
 
@@ -294,17 +393,20 @@ class BlockCausalLayer(nn.Module):
         layer_index: int,
         time_every: int,
         latents_only_time: bool,
+        qk_norm: bool = False,
+        soft_cap: float = 0.0,
     ):
         super().__init__()
         self.do_time = ((layer_index + 1) % time_every == 0)
+        device = modality_ids.device
 
         self.norm1 = RMSNorm(d_model)
-        self.space = SpaceSelfAttentionModality(d_model, n_heads, modality_ids, n_latents, space_mode, dropout)
+        self.space = SpaceSelfAttentionModality(d_model, n_heads, modality_ids, n_latents, space_mode, dropout, qk_norm=qk_norm, soft_cap=soft_cap)
         self.drop1 = nn.Dropout(dropout)
 
         if self.do_time:
             self.norm2 = RMSNorm(d_model)
-            self.time = TimeSelfAttention(d_model, n_heads, dropout, latents_only_time, n_latents)
+            self.time = TimeSelfAttention(d_model, n_heads, dropout, latents_only_time, n_latents, device=device, qk_norm=qk_norm, soft_cap=soft_cap)
             self.drop2 = nn.Dropout(dropout)
 
         self.norm3 = RMSNorm(d_model)
@@ -314,8 +416,9 @@ class BlockCausalLayer(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x + self.drop1(self.space(self.norm1(x)))
         if self.do_time:
+            # new_x = x_unromed + x_normed_with_new_latents
             x = x + self.drop2(self.time(self.norm2(x)))
-        x = x + self.drop3(self.mlp(self.norm3(x)))
+        x = x + self.mlp(self.norm3(x))
         return x
 
 
@@ -332,6 +435,9 @@ class BlockCausalTransformer(nn.Module):
         mlp_ratio: float,
         time_every: int,
         latents_only_time: bool,
+        gradient_checkpointing: bool = False,
+        qk_norm: bool = False,
+        soft_cap: float = 0.0,
     ):
         super().__init__()
         self.layers = nn.ModuleList([
@@ -341,13 +447,19 @@ class BlockCausalTransformer(nn.Module):
                 dropout=dropout, mlp_ratio=mlp_ratio,
                 layer_index=i, time_every=time_every,
                 latents_only_time=latents_only_time,
+                qk_norm=qk_norm, soft_cap=soft_cap,
             )
             for i in range(depth)
         ])
 
+        self.gradient_checkpointing = gradient_checkpointing
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         for layer in self.layers:
-            x = layer(x)
+            if self.gradient_checkpointing and self.training:
+                x = checkpoint(layer, x, use_reentrant=False)
+            else:
+                x = layer(x)
         return x
 
 
@@ -368,6 +480,9 @@ class Encoder(nn.Module):
         latents_only_time: bool = True,
         mae_p_min: float = 0.0,
         mae_p_max: float = 0.9,
+        gradient_checkpointing: bool = False,
+        qk_norm: bool = False,
+        soft_cap: float = 0.0
     ):
         super().__init__()
         self.d_model = d_model
@@ -378,7 +493,7 @@ class Encoder(nn.Module):
         self.bottleneck_proj = nn.Linear(d_model, d_bottleneck)
 
         self.layout = TokenLayout(n_latents=n_latents, segments=((Modality.IMAGE, n_patches),))
-        modality_ids = self.layout.modality_ids()  # CPU buffer, moves with .to(device)
+        modality_ids = self.layout.modality_ids().to(self.patch_proj.weight.device)
 
         self.transformer = BlockCausalTransformer(
             d_model=d_model, n_heads=n_heads, depth=depth,
@@ -386,6 +501,8 @@ class Encoder(nn.Module):
             space_mode="encoder",
             dropout=dropout, mlp_ratio=mlp_ratio,
             time_every=time_every, latents_only_time=latents_only_time,
+            gradient_checkpointing=gradient_checkpointing,
+            qk_norm=qk_norm, soft_cap=soft_cap
         )
         self.mae = MAEReplacer(d_model=d_model, p_min=mae_p_min, p_max=mae_p_max)
 
@@ -394,14 +511,14 @@ class Encoder(nn.Module):
 
     def forward(self, patch_tokens_btnd: torch.Tensor):
         B, T, Np, Dp = patch_tokens_btnd.shape
-        assert Np == self.n_patches
+        # assert Np == self.n_patches
 
         proj = self.patch_proj(patch_tokens_btnd)            # (B,T,Np,D)
         proj_masked, mae_mask, keep_prob = self.mae(proj)    # (B,T,Np,D), (B,T,Np,1), (B,T,1)
 
         lat = self.latents.view(1, 1, self.n_latents, -1).expand(B, T, -1, -1)
         tokens = torch.cat([lat, proj_masked], dim=2)        # (B,T,S,D)
-        tokens = add_sinusoidal_positions(tokens)
+        # tokens = add_sinusoidal_positions(tokens)
 
         enc = self.transformer(tokens)
         z = torch.tanh(self.bottleneck_proj(enc[:, :, :self.n_latents, :]))
@@ -423,6 +540,9 @@ class Decoder(nn.Module):
         mlp_ratio: float = 4.0,
         time_every: int = 4,
         latents_only_time: bool = True,
+        gradient_checkpointing: bool = False,
+        qk_norm: bool = False,
+        soft_cap: float = 0.0
     ):
         super().__init__()
         self.n_latents = n_latents
@@ -435,7 +555,7 @@ class Decoder(nn.Module):
         self.patch_head = nn.Linear(d_model, d_patch)
 
         self.layout = TokenLayout(n_latents=n_latents, segments=((Modality.IMAGE, n_patches),))
-        modality_ids = self.layout.modality_ids()
+        modality_ids = self.layout.modality_ids().to(self.up_proj.weight.device)
 
         self.transformer = BlockCausalTransformer(
             d_model=d_model, n_heads=n_heads, depth=depth,
@@ -443,16 +563,18 @@ class Decoder(nn.Module):
             space_mode="decoder",
             dropout=dropout, mlp_ratio=mlp_ratio,
             time_every=time_every, latents_only_time=latents_only_time,
+            gradient_checkpointing=gradient_checkpointing,
+            qk_norm=qk_norm, soft_cap=soft_cap
         )
 
     def forward(self, z_btLd: torch.Tensor) -> torch.Tensor:
         B, T, L, _ = z_btLd.shape
-        assert L == self.n_latents
+        # assert L == self.n_latents
 
         lat = torch.tanh(self.up_proj(z_btLd))                                 # (B,T,L,D)
         qry = self.patch_queries.view(1, 1, self.n_patches, -1).expand(B, T, -1, -1)
         tokens = torch.cat([lat, qry], dim=2)                                  # (B,T,S,D)
-        tokens = add_sinusoidal_positions(tokens)
+        # tokens = add_sinusoidal_positions(tokens)
 
         x = self.transformer(tokens)
         x_p = x[:, :, L:, :]
@@ -477,7 +599,7 @@ def pack_bottleneck_to_spatial(z_btLd: torch.Tensor, *, n_spatial: int, k: int) 
     -> (B,T,n_spatial,D_b*k)
     """
     B, T, L, D = z_btLd.shape
-    assert L == n_spatial * k, f"L={L} must equal n_spatial*k={n_spatial*k}"
+    # assert L == n_spatial * k, f"L={L} must equal n_spatial*k={n_spatial*k}"
     return z_btLd.view(B, T, n_spatial, k * D)
 
 
@@ -486,7 +608,7 @@ def unpack_spatial_to_bottleneck(z_btSd: torch.Tensor, *, k: int) -> torch.Tenso
     z: (B,T,n_spatial,D_b*k) -> (B,T,n_spatial*k,D_b)
     """
     B, T, S, DK = z_btSd.shape
-    assert DK % k == 0, f"D={DK} must be divisible by k={k}"
+    # assert DK % k == 0, f"D={DK} must be divisible by k={k}"
     D = DK // k
     return z_btSd.view(B, T, S * k, D)
 
@@ -584,6 +706,8 @@ class Dynamics(nn.Module):
         mlp_ratio: float = 4.0,
         time_every: int = 4,
         space_mode: str = "wm_agent_isolated",  # or "wm_agent"
+        qk_norm: bool = False,
+        soft_cap: float = 0.0
     ):
         super().__init__()
         assert d_spatial % d_bottleneck == 0, "expected packing: d_spatial = d_bottleneck * packing_factor"
@@ -605,7 +729,7 @@ class Dynamics(nn.Module):
         self.step_embed = nn.Embedding(self.num_step_bins, self.d_model)
         self.signal_embed = nn.Embedding(self.k_max + 1, self.d_model)
 
-        segments = [
+        segments =[
             (Modality.ACTION, 1),
             (Modality.SHORTCUT_SIGNAL, 1),
             (Modality.SHORTCUT_STEP, 1),
@@ -619,7 +743,7 @@ class Dynamics(nn.Module):
         sl = self.layout.slices()
         self.spatial_slice = sl[Modality.SPATIAL]
         self.agent_slice = sl.get(Modality.AGENT, slice(0, 0))
-        modality_ids = self.layout.modality_ids()
+        modality_ids = self.layout.modality_ids().to(self.spatial_proj.weight.device)
 
         self.transformer = BlockCausalTransformer(
             d_model=self.d_model,
@@ -632,6 +756,8 @@ class Dynamics(nn.Module):
             mlp_ratio=float(mlp_ratio),
             time_every=int(time_every),
             latents_only_time=False,
+            qk_norm=qk_norm,
+            soft_cap=soft_cap
         )
 
         self.flow_x_head = nn.Linear(self.d_model, self.d_spatial)
@@ -667,12 +793,12 @@ class Dynamics(nn.Module):
         if self.n_agent > 0:
             if agent_tokens is None:
                 agent_tokens = torch.zeros((B, T, self.n_agent, self.d_model), device=spatial_tokens.device, dtype=spatial_tokens.dtype)
-            toks = [action_tokens, sig_tok, step_tok, spatial_tokens, reg, agent_tokens]
+            toks =[action_tokens, sig_tok, step_tok, spatial_tokens, reg, agent_tokens]
         else:
-            toks = [action_tokens, sig_tok, step_tok, spatial_tokens, reg]
+            toks =[action_tokens, sig_tok, step_tok, spatial_tokens, reg]
 
         tokens = torch.cat(toks, dim=2)  # (B,T,S,D)
-        tokens = add_sinusoidal_positions(tokens)
+        # tokens = add_sinusoidal_positions(tokens)
         x = self.transformer(tokens)
 
         spatial_out = x[:, :, self.spatial_slice, :]

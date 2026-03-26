@@ -5,6 +5,15 @@
 wandb/
 logs/
 
+# Checkpoints / data / personal stuff
+*.pt
+*.onnx
+important_checkpoints/
+modelyyyyyy.py
+data/
+
+Constants.py
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

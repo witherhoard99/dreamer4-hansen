@@ -14,7 +14,7 @@ class ShardedFrameDataset(Dataset):
 
       root/<task>/*.pt  with {"frames": (N, 3, H, W) uint8}
 
-    Returns: (T, 3, H, W) float32 in [0,1], where T = seq_len.
+    Returns: (T, 3, H, W) in uint8, where T = seq_len.
 
     If iid_sampling=True, ignores idx and samples a random starting position
     uniformly over all valid sequence starts across all shards.
@@ -56,7 +56,7 @@ class ShardedFrameDataset(Dataset):
                     path = task_dir / fname
 
                     try:
-                        td = torch.load(path, map_location="cpu")
+                        td = torch.load(path, map_location="cpu", mmap=True, weights_only=True)
                     except Exception as e:
                         print(f"[ShardedFrameDataset] Skipping shard {path} (load error): {e}")
                         continue
@@ -100,7 +100,7 @@ class ShardedFrameDataset(Dataset):
     def _load_shard(self, path: str) -> torch.Tensor:
         if self._cache_path == path and self._cache_frames is not None:
             return self._cache_frames
-        td = torch.load(path, map_location="cpu")
+        td = torch.load(path, map_location="cpu", mmap=True, weights_only=True)
         frames = td["frames"]
         self._cache_path = path
         self._cache_frames = frames
@@ -131,4 +131,4 @@ class ShardedFrameDataset(Dataset):
 
         end = start + self.seq_len
         seq_u8 = frames[start:end]  # (T, 3, H, W), guaranteed valid by construction
-        return seq_u8.to(torch.float32) / 255.0
+        return seq_u8

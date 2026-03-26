@@ -63,13 +63,14 @@ def init_distributed() -> tuple[bool, int, int, int]:
     return ddp, rank, world_size, local_rank
 
 
-def save_ckpt(path: Path, *, step: int, epoch: int, dyn_model, opt, scaler, args: argparse.Namespace):
+def save_ckpt(path: Path, *, step: int, epoch: int, dyn_model, opt, scheduler, scaler, args: argparse.Namespace):
     path.parent.mkdir(parents=True, exist_ok=True)
     obj = {
         "step": step,
         "epoch": epoch,
         "dynamics": (dyn_model.module.state_dict() if hasattr(dyn_model, "module") else dyn_model.state_dict()),
         "opt": opt.state_dict(),
+        "scheduler": scheduler.state_dict() if scheduler is not None else None,
         "scaler": scaler.state_dict() if scaler is not None else None,
         "args": vars(args),
     }
@@ -78,14 +79,47 @@ def save_ckpt(path: Path, *, step: int, epoch: int, dyn_model, opt, scaler, args
     tmp.replace(path)
 
 
-def load_ckpt(path: Path, *, dyn_model, opt, scaler) -> tuple[int, int]:
+def load_ckpt(path: Path, *, dyn_model, opt, scheduler, scaler) -> tuple[int, int]:
     ckpt = torch.load(path, map_location="cpu")
     state = ckpt["dynamics"]
     (dyn_model.module if hasattr(dyn_model, "module") else dyn_model).load_state_dict(state, strict=True)
     opt.load_state_dict(ckpt["opt"])
+    if scheduler is not None and ckpt.get("scheduler") is not None:
+        scheduler.load_state_dict(ckpt["scheduler"])
     if scaler is not None and ckpt.get("scaler") is not None:
         scaler.load_state_dict(ckpt["scaler"])
     return int(ckpt.get("step", 0)), int(ckpt.get("epoch", 0))
+
+
+def get_scheduler(optimizer, args):
+    if args.lr_scheduler == "none":
+        return None
+
+    grad_accum = max(1, int(args.grad_accum))
+    max_updates = args.max_steps // grad_accum
+    warmup_updates = args.lr_warmup_steps // grad_accum
+
+    def lr_lambda(step):
+        # Warmup
+        if step < warmup_updates:
+            return float(step) / float(max(1, warmup_updates))
+
+        # After warmup
+        progress = float(step - warmup_updates) / float(max(1, max_updates - warmup_updates))
+        progress = min(1.0, max(0.0, progress))
+
+        if args.lr_scheduler == "linear":
+            # Linear decay to lr_min / lr
+            return max(args.lr_min / args.lr, 1.0 - progress * (1.0 - args.lr_min / args.lr))
+
+        elif args.lr_scheduler == "cosine":
+            # Cosine decay to lr_min / lr
+            cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
+            return args.lr_min / args.lr + (1.0 - args.lr_min / args.lr) * cosine_decay
+
+        return 1.0
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
 @torch.no_grad()
@@ -682,6 +716,7 @@ def train(args):
     opt = torch.optim.AdamW(
         dyn.parameters(), lr=args.lr, weight_decay=args.weight_decay, betas=(0.9, 0.999)
     )
+    scheduler = get_scheduler(opt, args)
     use_amp = torch.cuda.is_available()
     scaler = GradScaler(device="cuda", enabled=use_amp)
 
@@ -700,7 +735,7 @@ def train(args):
     start_epoch = 0
     ckpt_dir = Path(args.ckpt_dir)
     if args.resume is not None:
-        step, start_epoch = load_ckpt(Path(args.resume), dyn_model=dyn, opt=opt, scaler=scaler)
+        step, start_epoch = load_ckpt(Path(args.resume), dyn_model=dyn, opt=opt, scheduler=scheduler, scaler=scaler)
         if is_rank0():
             print(f"[rank0] Resumed from {args.resume} (step={step}, epoch={start_epoch})")
 
@@ -772,11 +807,14 @@ def train(args):
                 loss_to_backprop = loss / grad_accum
                 scaler.scale(loss_to_backprop).backward()
 
+                # capture grad norm if clipping is enabled
+                grad_norm = None
+
                 do_step = ((step + 1) % grad_accum == 0)
                 if do_step:
                     if args.grad_clip > 0:
                         scaler.unscale_(opt)
-                        torch.nn.utils.clip_grad_norm_(
+                        grad_norm = torch.nn.utils.clip_grad_norm_(
                             (dyn.module if hasattr(dyn, "module") else dyn).parameters(),
                             max_norm=args.grad_clip,
                         )
@@ -786,6 +824,10 @@ def train(args):
                         scaler.update()
                     else:
                         opt.step()
+
+                    if scheduler is not None:
+                        scheduler.step()
+
                     opt.zero_grad(set_to_none=True)
 
                 # Evaluation / visualization
@@ -855,21 +897,25 @@ def train(args):
                         action_shuffle_loss_ratio = torch.tensor(0., device=device)
 
                     # Log to wandb
-                    wandb.log(
-                        {
-                            "loss/total": float(loss.item()),
-                            "loss/flow_mse": float(aux["flow_mse"].item()),
-                            "loss/bootstrap_mse": float(aux["bootstrap_mse"].item()),
-                            "loss/loss_emp": float(aux["loss_emp"].item()),
-                            "loss/loss_self": float(aux["loss_self"].item()),
-                            "stats/action_shuffle_loss_ratio": float(action_shuffle_loss_ratio.item()),
-                            "stats/sigma_mean": float(aux["sigma_mean"].item()),
-                            "stats/B_self": float(B_self),
-                            "lr": float(opt.param_groups[0]["lr"]),
-                            "time/hrs": (time.time() - t0) / 3600.0,
-                        },
-                        step=step,
-                    )
+                    log_dict = {
+                        "loss/total": float(loss.item()),
+                        "loss/flow_mse": float(aux["flow_mse"].item()),
+                        "loss/bootstrap_mse": float(aux["bootstrap_mse"].item()),
+                        "loss/loss_emp": float(aux["loss_emp"].item()),
+                        "loss/loss_self": float(aux["loss_self"].item()),
+                        "stats/action_shuffle_loss_ratio": float(action_shuffle_loss_ratio.item()),
+                        "stats/sigma_mean": float(aux["sigma_mean"].item()),
+                        "stats/B_self": float(B_self),
+                        "lr": float(opt.param_groups[0]["lr"]),
+                        "time/hrs": (time.time() - t0) / 3600.0,
+                    }
+                    if grad_norm is not None:
+                        try:
+                            log_dict["stats/grad_norm"] = float(grad_norm)
+                        except Exception:
+                            pass
+
+                    wandb.log(log_dict, step=step)
 
                     # Log to console
                     print(
@@ -882,9 +928,9 @@ def train(args):
                 # Checkpointing
                 if is_rank0() and args.save_every > 0 and (step % args.save_every == 0) and do_step:
                     ckpt_path = ckpt_dir / f"step_{step:07d}.pt"
-                    save_ckpt(ckpt_path, step=step, epoch=epoch, dyn_model=dyn, opt=opt, scaler=scaler, args=args)
+                    save_ckpt(ckpt_path, step=step, epoch=epoch, dyn_model=dyn, opt=opt, scheduler=scheduler, scaler=scaler, args=args)
                     latest = ckpt_dir / "latest.pt"
-                    save_ckpt(latest, step=step, epoch=epoch, dyn_model=dyn, opt=opt, scaler=scaler, args=args)
+                    save_ckpt(latest, step=step, epoch=epoch, dyn_model=dyn, opt=opt, scheduler=scheduler, scaler=scaler, args=args)
 
                 step += 1
 
@@ -944,6 +990,9 @@ if __name__ == "__main__":
 
     # optim
     p.add_argument("--lr", type=float, default=1e-4)
+    p.add_argument("--lr_scheduler", type=str, default="none", choices=["none", "linear", "cosine"])
+    p.add_argument("--lr_warmup_steps", type=int, default=0)
+    p.add_argument("--lr_min", type=float, default=0.0)
     p.add_argument("--weight_decay", type=float, default=1e-2)
     p.add_argument("--max_steps", type=int, default=10_000_000)
     p.add_argument("--grad_accum", type=int, default=1)
